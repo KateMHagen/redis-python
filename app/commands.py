@@ -349,7 +349,7 @@ async def handle_xadd(data, stream_store, writer):
         new_entry = StreamEntry(entry_id, entry_data)
         await add_entry(new_entry, entry_id, stream_name, stream_store, writer)
         
-    
+
 
 async def add_entry(new_entry, entry_id, stream_name, stream_store, writer):
     stream_key = StreamEntries(entries=[])
@@ -417,106 +417,184 @@ async def handle_xread(data, stream_store, writer):
     print("from handle_xread")
     print(data)
 
-    # Initialize response
-    if len(data) > 10:
-        res = f"*2\r\n"  # Multiple streams
-    else:
-        res = f"*1\r\n"  # Single stream
-
+    # # Initialize response
+    # if len(data) > 10:
+    #     res = f"*2\r\n"  # Multiple streams
+    # else:
+    #     res = f"*1\r\n"  # Single stream
+    res = ""
     block = False  # Initialize block as False
-
+    blocking = False
     new_entry = "ignore"
+
     # Handle blocking
     if "block" in data:
         block = True
         time_block = int(data[data.index("block") + 2]) / 1000
-        print("Sleeping for:", time_block)
+        print("Blocking for:", time_block)
+
         initial_stream_state = {
             stream_key: len(stream_entries.entries)
             for stream_key, stream_entries in stream_store.entries.items()
         }
-        await asyncio.sleep(time_block)  # Use await for non-blocking sleep
-        
-        print("Not sleeping anymore")
-        for stream_key, stream_entries in stream_store.entries.items():
+
+        # Handle the case for "BLOCK 0"
+        if time_block == 0:
+            blocking = True
+            # Continuously check for new entries
+            while new_entry == "ignore":
+                await asyncio.sleep(0.1)  # Polling interval (100 ms)
+                for stream_key, stream_entries in stream_store.entries.items():
+                    if len(stream_entries.entries) > initial_stream_state[stream_key]:
+                        new_entry = "yes"
+                        break
+        else:
+            # Handle regular block with a time limit
+            await asyncio.sleep(time_block)  # Use await for non-blocking sleep
+            print("Not sleeping anymore")
+            # Check if there is a new entry
+            for stream_key, stream_entries in stream_store.entries.items():
                 if len(stream_entries.entries) > initial_stream_state[stream_key]:
                     new_entry = "yes"
                     break
-                else:
-                    new_entry = "no"
-                
-            
-                
-   
+            else:
+                new_entry = "no"
+
     stream_count = (len(data) - 6) // 2
+
+    print(f'thisis stream cnt {stream_count}')
     n = 0
     i = 0
-    
-    # Loop through each stream and last ID
-    while i < stream_count:
-        if block and new_entry:
-            for stream_key, stream_entries in stream_store.entries.items():
-                # Check if there are entries in the stream
-                if stream_entries.entries:
-                    last_entry = stream_entries.entries[-1]  # Accessing the last StreamEntry
-                    # Outputting the individual attributes
-                    print(f"Stream: {stream_key}")
-                    print(f"Last Entry ID: {last_entry.id}")  # Output the ID of the last entry
-                    print(f"Last Entry Data: {last_entry.data}")  # Output the data of the last entry
-                    
-                    for key, value in last_entry.data.items():
-                        print(f"{key}: {value}")  # Output each key-value pair
-                        key = key
-                        value = value
-                    res = f"*1\r\n*2\r\n${len(stream_key)}\r\n{stream_key}\r\n*1\r\n*2\r\n${len(last_entry.id)}\r\n{last_entry.id}\r\n*2\r\n${len(key)}\r\n{key}\r\n${len(value)}\r\n{value}\r\n"
-                   
-            break
-    
-        
+
+    if data[4] == "streams":
+        # If multiple streams
         if len(data) > 10:
-            stream_key = data[6 + n]
-            id = data[10 + n]
-            n = 2
-            i += 1
+            res = f"*2\r\n"
+        # If single stream
         else:
-            stream_key = data[6]
-            id = data[8]
-            i = stream_count
-        
-        matching_entries = []
-        print(f'Processing key: {stream_key}, last ID: {id}')
+            res = f"*1\r\n"
+        stream_count = (len(data) - 6) // 2
+        n = 0
+        i = 0
+        # Loop through each stream and last ID
+        while i < stream_count:
+            if len(data) > 10:
+                stream_key = data[6 + n]
+                id = data[10 + n]
+                n = 2
+                i += 1
+            else:
+                stream_key = data[6]
+                id = data[8]
+                i = stream_count
+            matching_entries = []
+            print(f"Processing key: {stream_key}, id: {id}")
+            # Check if the stream exists and filter entries by last ID
+            if stream_key in stream_store.entries:
+                for entry in stream_store.entries[stream_key].entries:
+                    entry_id = entry.id
+                    if id < entry.id:  # Match entries with IDs greater than last_id
+                        matching_entries.append(entry)
+            # Construct response for the current stream
+            res += f"*{len(stream_store.entries[stream_key].entries[0].__dict__)}\r\n"
+            res += f"${len(stream_key)}\r\n{stream_key}\r\n"
+            res += f"*{len(matching_entries)}\r\n"
+            res += f"*{len(stream_store.entries[stream_key].entries[0].__dict__)}\r\n"
+    
+            for entry in matching_entries:
+                # Add entry ID
+                res += f"${len(entry_id)}\r\n{entry.id}\r\n"
+                # Add the number of fields in "data"
+                res += f"*{len(entry.data) * 2}\r\n"  # Each key-value pair counts as 2 elements in RESP
+                # Loop through the data dictionary of the current entry
+                for data_key, data_value in entry.data.items():
+                    # Add the key
+                    res += f"${len(data_key)}\r\n{data_key}\r\n"
+                    # Add the value
+                    res += f"${len(data_value)}\r\n{data_value}\r\n"
+        # Write the complete response
+        print(f"This is res: {res.encode()}")
+        writer.write(res.encode())
+        await writer.drain()
+    # Loop through each stream and last ID
+    else:
+        while i < stream_count:
+            if block and new_entry == "yes" and not blocking:
+                for stream_key, stream_entries in stream_store.entries.items():
+                    # Check if there are entries in the stream
+                    if stream_entries.entries:
+                        last_entry = stream_entries.entries[-1]  # Accessing the last StreamEntry
 
-        # Check if the stream exists and filter entries by last ID
-        if stream_key in stream_store.entries:
-            for entry in stream_store.entries[stream_key].entries:
-                entry_id = entry.id
-                if id < entry.id:  # Match entries with IDs greater than last_id
-                    matching_entries.append(entry)
+                        print(f"Stream: {stream_key}")
+                        print(f"Last Entry ID: {last_entry.id}")  # Output the ID of the last entry
+                        print(f"Last Entry Data: {last_entry.data}")  # Output the data of the last entry
+                        # Construct the response for the last entry
+                        res = f"*1\r\n*2\r\n${len(stream_key)}\r\n{stream_key}\r\n*1\r\n*2\r\n"
+                        res += f"${len(last_entry.id)}\r\n{last_entry.id}\r\n"
 
-         # Construct response for the current stream
-        res += f"*{len(stream_store.entries[stream_key].entries[0].__dict__)}\r\n"
-        res += f"${len(stream_key)}\r\n{stream_key}\r\n"
-        res += f"*{len(matching_entries)}\r\n"
-        res += f"*{len(stream_store.entries[stream_key].entries[0].__dict__)}\r\n"
+                        # Add the fields and values of the last entry
+                        res += f"*{len(last_entry.data) * 2}\r\n"
+                        for key, value in last_entry.data.items():
+                            res += f"${len(key)}\r\n{key}\r\n"
+                            res += f"${len(value)}\r\n{value}\r\n"
 
+                await writer.drain()
+                writer.write(res.encode())
+                await writer.drain()
+                return  # Exit the function to prevent sending the response twice
 
-        for entry in matching_entries:
-            # Add entry ID
-            res += f"${len(entry_id)}\r\n{entry.id}\r\n"
-            # Add the number of fields in "data"
-            res += f"*{len(entry.data) * 2}\r\n"  # Each key-value pair counts as 2 elements in RESP
-            # Loop through the data dictionary of the current entry
-            for data_key, data_value in entry.data.items():
-                # Add the key
-                res += f"${len(data_key)}\r\n{data_key}\r\n"
-                # Add the value
-                res += f"${len(data_value)}\r\n{data_value}\r\n"
+            if len(data) > 10:
+                stream_key = data[6 + n]
+                id = data[10 + n]
+                n = 2
+                i += 1
+            else:
+                stream_key = data[6]
+                id = data[8]
+                i = stream_count
 
-        
-    if new_entry == "no":
-        res = "$-1\r\n"  
+            # Adjust for BLOCK 0 case if it's present
+            if block and time_block == 0:
+                stream_key = data[10]
+                id = data[12]
+
+            matching_entries = []
+            print(f'Processing key: {stream_key}, last ID: {id}')
+
+            # Check if the stream exists and filter entries by last ID
+            if stream_key in stream_store.entries:
+                for entry in stream_store.entries[stream_key].entries:
+                    entry_id = entry.id
+                    if id < entry.id:  # Match entries with IDs greater than last_id
+                        matching_entries.append(entry)
             
+            print(f'this is matching {matching_entries}')
+            # Construct response for the current stream
+
+            
+            if matching_entries:
+                res += f"*1\r\n*2\r\n"
+                res += f"${len(stream_key)}\r\n{stream_key}\r\n"
+                res += f"*{len(matching_entries)}\r\n"
+
+                # Loop through matching entries
+                for entry in matching_entries:
+                    res += f"*2\r\n"
+                    res += f"${len(entry.id)}\r\n{entry.id}\r\n"
+                    res += f"*{len(entry.data) * 2}\r\n"  # Each key-value pair counts as 2 elements in RESP
+                    for data_key, data_value in entry.data.items():
+                        res += f"${len(data_key)}\r\n{data_key}\r\n"
+                        res += f"${len(data_value)}\r\n{data_value}\r\n"
+                writer.write(res.encode())
+                await writer.drain()
+        
+                
+    # If no new entry was added, return null bulk string
+    if new_entry == "no":
+        res = "$-1\r\n"
+
     # Write the complete response
     print(f'This is res: {res.encode()}')
+    
     writer.write(res.encode())
     await writer.drain()
